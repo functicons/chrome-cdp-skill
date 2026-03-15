@@ -7,20 +7,90 @@
 // the CDP session open. Chrome's "Allow debugging" modal fires once per
 // daemon (= once per tab). Daemons auto-exit after 20min idle.
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync } from 'fs';
+import { readFileSync, writeFileSync, appendFileSync, unlinkSync, chmodSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
 import { spawn } from 'child_process';
 import net from 'net';
 
+// ---------------------------------------------------------------------------
+// Config: ~/.chrome-cdp/config.json (env vars override config file values)
+// ---------------------------------------------------------------------------
+
+const CONFIG_DIR = resolve(homedir(), '.chrome-cdp');
+const CONFIG_FILE = resolve(CONFIG_DIR, 'config.json');
+
+function loadConfig() {
+  try {
+    mkdirSync(CONFIG_DIR, { recursive: true });
+  } catch {}
+  try {
+    if (existsSync(CONFIG_FILE)) return JSON.parse(readFileSync(CONFIG_FILE, 'utf8'));
+  } catch (e) {
+    process.stderr.write(`Warning: failed to parse ${CONFIG_FILE}: ${e.message}\n`);
+  }
+  return {};
+}
+
+const config = loadConfig();
+
 const TIMEOUT = 15000;
 const NAVIGATION_TIMEOUT = 30000;
-const IDLE_TIMEOUT = 20 * 60 * 1000;
+const IDLE_TIMEOUT = (parseInt(process.env.CDP_IDLE_TIMEOUT || '') || config.idleTimeout || 1200) * 1000;
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
 const SOCK_PREFIX = '/tmp/cdp-';
-const PAGES_CACHE = '/tmp/cdp-pages.json';
+const PAGES_CACHE = resolve(CONFIG_DIR, 'pages.json');
+const AUDIT_LOG = process.env.CDP_AUDIT_LOG || resolve(CONFIG_DIR, 'audit.log');
+
+// Commands that require CDP_ALLOW_EVAL or --allow-eval when safe mode is on
+const UNSAFE_CMDS = new Set(['eval', 'evalraw']);
+
+// URL access control: config.allow/config.block arrays, overridden by CDP_ALLOW/CDP_BLOCK env vars
+function parsePatterns(envVar, configKey) {
+  const envRaw = process.env[envVar] || '';
+  if (envRaw) return envRaw.split(',').map(p => p.trim()).filter(Boolean);
+  return Array.isArray(config[configKey]) ? config[configKey] : [];
+}
+
+function urlMatchesPattern(url, pattern) {
+  const regex = new RegExp('^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$', 'i');
+  return regex.test(url);
+}
+
+function urlMatchesAny(url, patterns) {
+  return patterns.some(p => urlMatchesPattern(url, p));
+}
+
+function isUrlBlocked(url) {
+  const allowPatterns = parsePatterns('CDP_ALLOW', 'allow');
+  const blockPatterns = parsePatterns('CDP_BLOCK', 'block');
+  if (allowPatterns.length > 0 && !urlMatchesAny(url, allowPatterns)) return true;
+  if (blockPatterns.length > 0 && urlMatchesAny(url, blockPatterns)) return true;
+  return false;
+}
+
+function isSafeMode() {
+  if (process.env.CDP_SAFE !== undefined) return process.env.CDP_SAFE === '1';
+  return config.safe === true;
+}
+
+function isEvalAllowed() {
+  if (process.env.CDP_ALLOW_EVAL !== undefined) return process.env.CDP_ALLOW_EVAL === '1';
+  return config.allowEval === true;
+}
+
+function auditLog(cmd, targetId, args, url) {
+  const noAudit = process.env.CDP_NO_AUDIT !== undefined
+    ? process.env.CDP_NO_AUDIT === '1'
+    : config.noAudit === true;
+  if (noAudit) return;
+  const ts = new Date().toISOString();
+  const argStr = (args || []).map(a => String(a).substring(0, 200)).join(' ');
+  const line = `${ts}  ${cmd.padEnd(8)}  ${(targetId || '-').substring(0, 12)}  ${(url || '-').substring(0, 80)}  ${argStr}\n`;
+  try { appendFileSync(AUDIT_LOG, line); } catch {}
+}
 
 function sockPath(targetId) { return `${SOCK_PREFIX}${targetId}.sock`; }
 
@@ -481,9 +551,29 @@ async function runDaemon(targetId) {
     idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
   }
 
+  // Resolve tab URL for block-checking and audit logging
+  let tabUrl = '';
+  try {
+    const targets = await cdp.send('Target.getTargets');
+    const target = targets.targetInfos?.find(t => t.targetId === targetId);
+    if (target) tabUrl = target.url || '';
+  } catch {}
+
   // Handle a command
   async function handleCommand({ cmd, args }) {
     resetIdle();
+    auditLog(cmd, targetId, args, tabUrl);
+
+    // Block commands to protected URLs
+    if (isUrlBlocked(tabUrl) && cmd !== 'stop') {
+      return { ok: false, error: `Blocked: tab URL not permitted by access policy (${tabUrl})` };
+    }
+
+    // Safe mode: reject eval/evalraw unless explicitly allowed
+    if (isSafeMode() && UNSAFE_CMDS.has(cmd) && !isEvalAllowed()) {
+      return { ok: false, error: `Blocked: "${cmd}" is disabled in safe mode (CDP_SAFE=1). Set CDP_ALLOW_EVAL=1 to override.` };
+    }
+
     try {
       let result;
       switch (cmd) {
@@ -547,7 +637,9 @@ async function runDaemon(targetId) {
   });
 
   try { unlinkSync(sp); } catch {}
-  server.listen(sp);
+  server.listen(sp, () => {
+    try { chmodSync(sp, 0o600); } catch {}
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -716,6 +808,29 @@ EVAL SAFETY NOTE
   "Ignore" buttons on a feed — indices shift). Prefer stable selectors or
   collect all data in a single eval.
 
+CONFIGURATION
+  Config dir: ~/.chrome-cdp/
+    config.json   Settings (optional, all fields optional)
+    audit.log     Command audit log
+    pages.json    Cached tab list
+
+  Example ~/.chrome-cdp/config.json:
+    {
+      "allow": ["*linkedin.com*", "*github.com*"],
+      "block": ["*bank.com*", "*schwab*"],
+      "safe": false,
+      "allowEval": false,
+      "idleTimeout": 1200,
+      "noAudit": false
+    }
+
+  Environment variables override config.json:
+    CDP_ALLOW, CDP_BLOCK, CDP_SAFE, CDP_ALLOW_EVAL, CDP_IDLE_TIMEOUT,
+    CDP_AUDIT_LOG, CDP_NO_AUDIT
+
+  Unix sockets are owner-only (chmod 600). All commands are logged to the
+  audit log with timestamp, command, target, URL, and arguments.
+
 DAEMON IPC (for advanced use / scripting)
   Each tab runs a persistent daemon at Unix socket: /tmp/cdp-<fullTargetId>.sock
   Protocol: newline-delimited JSON (one JSON object per line, UTF-8).
@@ -724,7 +839,7 @@ DAEMON IPC (for advanced use / scripting)
            or {"id":<number>, "ok":false, "error":"<message>"}
   Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy,
   type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods.
-  The socket disappears after 20 min of inactivity or when the tab closes.
+  The socket disappears after idle timeout or when the tab closes.
 `;
 
 const NEEDS_TARGET = new Set([
@@ -733,7 +848,9 @@ const NEEDS_TARGET = new Set([
 ]);
 
 async function main() {
-  const [cmd, ...args] = process.argv.slice(2);
+  if (process.argv.includes('--allow-eval')) process.env.CDP_ALLOW_EVAL = '1';
+  const rawArgs = process.argv.slice(2).filter(a => a !== '--allow-eval');
+  const [cmd, ...args] = rawArgs;
 
   // Daemon mode (internal)
   if (cmd === '_daemon') { await runDaemon(args[0]); return; }
@@ -744,6 +861,7 @@ async function main() {
 
   // List — use existing daemon if available, otherwise direct
   if (cmd === 'list' || cmd === 'ls') {
+    auditLog('list', null, []);
     let pages;
     const existingSock = findAnyDaemonSocket();
     if (existingSock) {
@@ -768,6 +886,7 @@ async function main() {
 
   // Stop
   if (cmd === 'stop') {
+    auditLog('stop', args[0] || '*', []);
     await stopDaemons(args[0]);
     return;
   }
@@ -799,6 +918,24 @@ async function main() {
     }
     const pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
     targetId = resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
+  }
+
+  // Check URL blocklist before connecting to tab
+  if (existsSync(PAGES_CACHE)) {
+    try {
+      const cachedPages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
+      const targetPage = cachedPages.find(p => p.targetId === targetId);
+      if (targetPage && isUrlBlocked(targetPage.url)) {
+        console.error(`Blocked: tab URL not permitted by access policy (${targetPage.url})`);
+        process.exit(1);
+      }
+    } catch {}
+  }
+
+  // Safe mode: reject eval/evalraw from CLI before connecting
+  if (isSafeMode() && UNSAFE_CMDS.has(cmd) && !isEvalAllowed()) {
+    console.error(`Blocked: "${cmd}" is disabled in safe mode (CDP_SAFE=1). Set CDP_ALLOW_EVAL=1 to override.`);
+    process.exit(1);
   }
 
   const conn = await getOrStartTabDaemon(targetId);
