@@ -1,6 +1,6 @@
 ---
 name: chrome-tab-control
-description: Interact with Chrome tabs shared by the user via the Tab Control extension (no --remote-debugging-port needed)
+description: Control user-shared Chrome tabs — take screenshots, inspect accessibility trees, evaluate JS, navigate, click elements, type text, and monitor console/network activity in real time
 ---
 
 # Chrome Tab Control
